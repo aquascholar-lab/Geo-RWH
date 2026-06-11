@@ -2,10 +2,20 @@
 # Geo-RWH-SRP+ : Smart GIS Web Portal for Rainwater Harvesting
 # and Spring Rejuvenation Planning
 # ================================================================
-# Author: Prepared for GIS-based weighted overlay + ROC/AUC validation
+# Major functions:
+#   1. Upload 10 classified GeoTIFF suitability factor layers
+#   2. Apply AHP default weights or user-adjusted weights
+#   3. Perform weighted overlay
+#   4. Classify final suitability into 4 classes
+#   5. Classification methods: Equal interval, Quantile, Jenks, Manual
+#   6. Interactive map with dark legend, north arrow, scale and spring CSV points
+#   7. Area statistics in sq. km and percentage
+#   8. ROC-AUC validation using spring/non-spring point shapefile ZIP
+# ================================================================
 # Run:
-#   pip install streamlit rasterio geopandas folium streamlit-folium \
-#               matplotlib scikit-learn pandas numpy pillow shapely pyproj
+#   conda create -n geo_rwh python=3.10 -y
+#   conda activate geo_rwh
+#   pip install -r requirements_geo_rwh_srp.txt
 #   streamlit run geo_rwh_srp_streamlit_app.py
 # ================================================================
 
@@ -23,11 +33,11 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from rasterio.transform import rowcol
 import geopandas as gpd
 import folium
-from folium.plugins import Fullscreen, MeasureControl, MousePosition
+from folium.plugins import Fullscreen, MeasureControl, MousePosition, MarkerCluster
 from streamlit_folium import st_folium
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 from PIL import Image
+from pyproj import Transformer
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, classification_report
 
 
@@ -46,35 +56,48 @@ st.set_page_config(
 # App constants
 # -----------------------------
 FACTOR_SPECS = [
-    {"key": "cn", "label": "Curve Number", "hint": "cn.tif"},
-    {"key": "d_str", "label": "Distance from Stream", "hint": "d_str.tif"},
-    {"key": "ddensity", "label": "Drainage Density", "hint": "ddensity.tif"},
+    {"key": "cn", "label": "Curve Number (CN)", "hint": "cn.tif"},
+    {"key": "rain_monsoon", "label": "Rainfall", "hint": "rain_monsoon.tif"},
     {"key": "geology", "label": "Geology", "hint": "geology.tif"},
-    {"key": "lineaments", "label": "Lineaments", "hint": "lineaments.tif"},
-    {"key": "lulc", "label": "Land Use/Land Cover", "hint": "lulc.tif"},
-    {"key": "rain_monsoon", "label": "Monsoon Rainfall", "hint": "rain_monsoon.tif"},
     {"key": "slope", "label": "Slope", "hint": "slope.tif"},
+    {"key": "twi", "label": "Topographic Wetness Index (TWI)", "hint": "twi.tif"},
+    {"key": "ddensity", "label": "Drainage Density", "hint": "ddensity.tif"},
+    {"key": "d_str", "label": "Stream Distance", "hint": "d_str.tif"},
     {"key": "soil", "label": "Soil", "hint": "soil.tif"},
-    {"key": "twi", "label": "Topographic Wetness Index", "hint": "twi.tif"},
+    {"key": "lulc", "label": "LULC", "hint": "lulc.tif"},
+    {"key": "lineaments", "label": "Lineament", "hint": "lineaments.tif"},
 ]
 
-CLASS_INFO = {
-    0: {"name": "NoData", "color": "#00000000"},
-    1: {"name": "Unsuitable", "color": "#d7191c"},
-    2: {"name": "Low Suitable", "color": "#fdae61"},
-    3: {"name": "Moderately Suitable", "color": "#ffffbf"},
-    4: {"name": "Highly Suitable", "color": "#a6d96a"},
-    5: {"name": "Very Highly Suitable", "color": "#1a9641"},
+# Default AHP weights taken from the provided table/image. Values are in percent.
+DEFAULT_WEIGHTS = {
+    "cn": 29.04,
+    "rain_monsoon": 20.99,
+    "geology": 15.08,
+    "slope": 10.78,
+    "twi": 7.62,
+    "ddensity": 5.27,
+    "d_str": 3.53,
+    "soil": 3.53,
+    "lulc": 2.41,
+    "lineaments": 1.75,
 }
 
-# RGBA values for PNG overlay: index 0 transparent, 1-5 classes
+# Final map has four classes only.
+CLASS_INFO = {
+    0: {"name": "NoData", "color": "#00000000"},
+    1: {"name": "Unsuitable", "color": "#d73027"},
+    2: {"name": "Moderately Suitable", "color": "#fee08b"},
+    3: {"name": "Highly Suitable", "color": "#91cf60"},
+    4: {"name": "Very Highly Suitable", "color": "#1a9850"},
+}
+
+# RGBA values for PNG overlay: index 0 transparent, 1-4 classes.
 CLASS_RGBA = np.array([
     [0, 0, 0, 0],          # 0 NoData
-    [215, 25, 28, 210],    # 1 Unsuitable
-    [253, 174, 97, 210],   # 2 Low
-    [255, 255, 191, 210],  # 3 Moderate
-    [166, 217, 106, 210],  # 4 High
-    [26, 150, 65, 210],    # 5 Very High
+    [215, 48, 39, 215],    # 1 Unsuitable
+    [254, 224, 139, 215],  # 2 Moderate
+    [145, 207, 96, 215],   # 3 High
+    [26, 152, 80, 215],    # 4 Very High
 ], dtype=np.uint8)
 
 
@@ -117,7 +140,7 @@ def read_and_align_raster(
     """
     Read a classified raster and align it to the reference raster.
     Classified rasters are expected to use values 1-5, where 5 = highly suitable.
-    Any value outside 1-5 can optionally be treated as NoData.
+    Values outside 1-5 can be treated as NoData.
     """
     dst_shape = (ref_meta["height"], ref_meta["width"])
     dst = np.full(dst_shape, np.nan, dtype="float32")
@@ -191,25 +214,130 @@ def weighted_overlay(arrays: dict, norm_weights: dict, missing_policy: str = "St
     return score.astype("float32")
 
 
-def classify_suitability(score: np.ndarray, method: str = "Equal interval"):
-    """Classify continuous suitability score into five classes."""
-    valid = np.isfinite(score)
-    cls = np.zeros(score.shape, dtype="uint8")
+def _custom_jenks_breaks(values: np.ndarray, n_classes: int = 4, sample_size: int = 5000):
+    """
+    Fisher-Jenks natural breaks fallback implementation.
+    For speed, large rasters are sampled reproducibly before break estimation.
+    Returns n_classes + 1 break values, including minimum and maximum.
+    """
+    data = np.asarray(values, dtype="float64")
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        raise ValueError("No valid values available for Jenks classification.")
 
-    if not np.any(valid):
+    if data.size > sample_size:
+        rng = np.random.default_rng(42)
+        data = rng.choice(data, size=sample_size, replace=False)
+
+    data = np.sort(data)
+    unique_vals = np.unique(data)
+    if unique_vals.size <= n_classes:
+        return np.linspace(float(data.min()), float(data.max()), n_classes + 1)
+
+    n_data = len(data)
+    lower_class_limits = np.zeros((n_data + 1, n_classes + 1), dtype=np.int32)
+    variance_combinations = np.full((n_data + 1, n_classes + 1), np.inf, dtype="float64")
+
+    for i in range(1, n_classes + 1):
+        lower_class_limits[1, i] = 1
+        variance_combinations[1, i] = 0
+
+    for l in range(2, n_data + 1):
+        sum_values = 0.0
+        sum_squares = 0.0
+        weight = 0.0
+        variance = 0.0
+
+        for m in range(1, l + 1):
+            lower_class_limit = l - m + 1
+            val = data[lower_class_limit - 1]
+            weight += 1
+            sum_values += val
+            sum_squares += val * val
+            variance = sum_squares - (sum_values * sum_values) / weight
+            previous_class_limit = lower_class_limit - 1
+
+            if previous_class_limit != 0:
+                for j in range(2, n_classes + 1):
+                    test_variance = variance + variance_combinations[previous_class_limit, j - 1]
+                    if variance_combinations[l, j] >= test_variance:
+                        lower_class_limits[l, j] = lower_class_limit
+                        variance_combinations[l, j] = test_variance
+
+        lower_class_limits[l, 1] = 1
+        variance_combinations[l, 1] = variance
+
+    breaks = np.zeros(n_classes + 1, dtype="float64")
+    breaks[n_classes] = data[-1]
+    breaks[0] = data[0]
+
+    k = n_data
+    count_num = n_classes
+    while count_num >= 2:
+        idx = int(lower_class_limits[k, count_num] - 2)
+        breaks[count_num - 1] = data[max(idx, 0)]
+        k = int(lower_class_limits[k, count_num] - 1)
+        count_num -= 1
+
+    return breaks
+
+
+def jenks_thresholds(values: np.ndarray, n_classes: int = 4):
+    """Return internal Jenks thresholds for n_classes."""
+    valid_values = values[np.isfinite(values)].astype("float64")
+    if valid_values.size == 0:
+        raise ValueError("No valid values available for Jenks classification.")
+
+    # Prefer jenkspy if installed because it is faster.
+    try:
+        import jenkspy
+        breaks = np.array(jenkspy.jenks_breaks(valid_values, n_classes=n_classes), dtype="float64")
+    except Exception:
+        breaks = _custom_jenks_breaks(valid_values, n_classes=n_classes, sample_size=5000)
+
+    internal = np.array(breaks[1:-1], dtype="float64")
+    if len(internal) != n_classes - 1 or len(np.unique(np.round(internal, 8))) != n_classes - 1:
+        # Duplicate thresholds may occur if the raster has too few unique values.
+        internal = np.nanpercentile(valid_values, [25, 50, 75]).astype("float64")
+    return internal
+
+
+def calculate_thresholds(score: np.ndarray, method: str):
+    """Calculate three thresholds for four suitability classes."""
+    valid = score[np.isfinite(score)]
+    if valid.size == 0:
         raise ValueError("No valid pixels available for classification.")
 
-    if method == "Quantile":
-        thresholds = np.nanpercentile(score[valid], [20, 40, 60, 80])
-        # In case of duplicate thresholds, use equal interval fallback.
-        if len(np.unique(np.round(thresholds, 6))) < 4:
-            thresholds = np.array([1.8, 2.6, 3.4, 4.2], dtype="float32")
+    if method == "Equal interval":
+        min_v = float(np.nanmin(valid))
+        max_v = float(np.nanmax(valid))
+        thresholds = np.linspace(min_v, max_v, 5)[1:-1]
+    elif method == "Quantile":
+        thresholds = np.nanpercentile(valid, [25, 50, 75])
+    elif method == "Jenks natural breaks":
+        thresholds = jenks_thresholds(score, n_classes=4)
     else:
-        # Suitable for 1-5 weighted score.
-        thresholds = np.array([1.8, 2.6, 3.4, 4.2], dtype="float32")
+        raise ValueError(f"Unsupported threshold method: {method}")
+
+    thresholds = np.array(thresholds, dtype="float64")
+    if len(np.unique(np.round(thresholds, 8))) < 3:
+        thresholds = np.linspace(float(np.nanmin(valid)), float(np.nanmax(valid)), 5)[1:-1]
+    return thresholds
+
+
+def classify_suitability(score: np.ndarray, thresholds):
+    """Classify continuous suitability score into four classes using three thresholds."""
+    valid = np.isfinite(score)
+    cls = np.zeros(score.shape, dtype="uint8")
+    thresholds = np.array(thresholds, dtype="float64")
+
+    if len(thresholds) != 3:
+        raise ValueError("Four-class classification requires exactly three threshold values.")
+    if not (thresholds[0] < thresholds[1] < thresholds[2]):
+        raise ValueError("Manual thresholds must be in increasing order: Break 1 < Break 2 < Break 3.")
 
     cls[valid] = np.digitize(score[valid], bins=thresholds, right=True).astype("uint8") + 1
-    return cls, thresholds
+    return cls
 
 
 def write_geotiff(out_path: str, arr: np.ndarray, ref_meta: dict, dtype: str, nodata):
@@ -229,7 +357,8 @@ def write_geotiff(out_path: str, arr: np.ndarray, ref_meta: dict, dtype: str, no
     if np.issubdtype(np.dtype(dtype), np.floating):
         out_arr = np.where(np.isfinite(arr), arr, nodata).astype(dtype)
     else:
-        out_arr = np.where(np.isfinite(arr), arr, nodata).astype(dtype)
+        out_arr = np.asarray(arr).astype(dtype)
+        out_arr = np.where(np.isfinite(out_arr), out_arr, nodata).astype(dtype)
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(out_arr, 1)
@@ -238,7 +367,7 @@ def write_geotiff(out_path: str, arr: np.ndarray, ref_meta: dict, dtype: str, no
 def create_class_png(class_array: np.ndarray, out_png: str):
     """Create transparent PNG overlay from classified array."""
     safe_cls = np.nan_to_num(class_array, nan=0).astype("uint8")
-    safe_cls = np.clip(safe_cls, 0, 5)
+    safe_cls = np.clip(safe_cls, 0, 4)
     rgba = CLASS_RGBA[safe_cls]
     img = Image.fromarray(rgba, mode="RGBA")
     img.save(out_png)
@@ -248,12 +377,12 @@ def add_legend(map_obj):
     legend_items = "".join(
         [
             f"""
-            <div style='display:flex;align-items:center;margin-bottom:4px;'>
-                <span style='background:{CLASS_INFO[i]['color']};width:18px;height:18px;display:inline-block;border:1px solid #555;margin-right:8px;'></span>
+            <div style='display:flex;align-items:center;margin-bottom:5px;color:#111111;font-weight:600;'>
+                <span style='background:{CLASS_INFO[i]['color']};width:18px;height:18px;display:inline-block;border:1px solid #333;margin-right:8px;'></span>
                 <span>{i}. {CLASS_INFO[i]['name']}</span>
             </div>
             """
-            for i in [5, 4, 3, 2, 1]
+            for i in [4, 3, 2, 1]
         ]
     )
 
@@ -263,14 +392,16 @@ def add_legend(map_obj):
         bottom: 32px;
         left: 32px;
         z-index: 9999;
-        background: white;
+        background: rgba(255,255,255,0.96);
+        color: #111111;
         padding: 12px 14px;
-        border: 2px solid #555;
+        border: 2px solid #333333;
         border-radius: 8px;
         font-size: 13px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        font-family: Arial, sans-serif;
     ">
-        <b>RWH/Spring Rejuvenation Suitability</b><br>
+        <div style="font-weight:800;color:#111111;margin-bottom:7px;">RWH/Spring Rejuvenation Suitability</div>
         {legend_items}
     </div>
     """
@@ -284,7 +415,8 @@ def add_north_arrow(map_obj):
         top: 95px;
         right: 28px;
         z-index: 9999;
-        background: rgba(255,255,255,0.92);
+        background: rgba(255,255,255,0.94);
+        color: #111111;
         padding: 8px 10px;
         border: 2px solid #333;
         border-radius: 6px;
@@ -294,14 +426,13 @@ def add_north_arrow(map_obj):
         box-shadow: 0 2px 8px rgba(0,0,0,0.25);
     ">
         N<br>
-        <span style="font-size: 30px; line-height: 20px;">▲</span>
+        <span style="font-size: 30px; line-height: 20px;color:#111111;">▲</span>
     </div>
     """
     map_obj.get_root().html.add_child(folium.Element(north_html))
 
 
-def make_folium_map(class_png: str, ref_meta: dict):
-    """Build interactive folium map with overlay, legend, north arrow and scale."""
+def raster_bounds_wgs84(ref_meta: dict):
     bounds_wgs84 = transform_bounds(
         ref_meta["crs"],
         "EPSG:4326",
@@ -312,6 +443,12 @@ def make_folium_map(class_png: str, ref_meta: dict):
         densify_pts=21,
     )
     west, south, east, north = bounds_wgs84
+    return west, south, east, north
+
+
+def make_folium_map(class_png: str, ref_meta: dict, springs_df: pd.DataFrame | None = None, label_col: str | None = None):
+    """Build interactive folium map with overlay, legend, north arrow, scale and optional spring CSV points."""
+    west, south, east, north = raster_bounds_wgs84(ref_meta)
     center = [(south + north) / 2, (west + east) / 2]
 
     m = folium.Map(
@@ -341,6 +478,35 @@ def make_folium_map(class_png: str, ref_meta: dict):
         tooltip="Analysis extent",
     ).add_to(m)
 
+    if springs_df is not None and not springs_df.empty:
+        cluster = MarkerCluster(name="Spring locations from CSV", overlay=True, control=True).add_to(m)
+        for idx, row in springs_df.iterrows():
+            lat = row.get("_map_lat")
+            lon = row.get("_map_lon")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            label = f"Spring {idx + 1}"
+            if label_col and label_col in springs_df.columns and pd.notna(row[label_col]):
+                label = str(row[label_col])
+            popup_lines = [f"<b>{label}</b>"]
+            for col in springs_df.columns:
+                if col.startswith("_map_"):
+                    continue
+                value = row[col]
+                if pd.notna(value):
+                    popup_lines.append(f"<b>{col}</b>: {value}")
+            folium.CircleMarker(
+                location=[float(lat), float(lon)],
+                radius=5,
+                color="#0033cc",
+                weight=2,
+                fill=True,
+                fill_color="#00ccff",
+                fill_opacity=0.9,
+                popup=folium.Popup("<br>".join(popup_lines), max_width=300),
+                tooltip=label,
+            ).add_to(cluster)
+
     Fullscreen(position="topright").add_to(m)
     MeasureControl(position="topleft", primary_length_unit="kilometers").add_to(m)
     MousePosition(position="bottomright", separator=" | ", prefix="Lat/Lon:").add_to(m)
@@ -352,18 +518,25 @@ def make_folium_map(class_png: str, ref_meta: dict):
 
 def plot_area_chart(class_array: np.ndarray, pixel_area_m2: float):
     rows = []
-    for i in [1, 2, 3, 4, 5]:
+    for i in [1, 2, 3, 4]:
         count = int(np.sum(class_array == i))
         area_km2 = count * pixel_area_m2 / 1_000_000
-        rows.append({"Class": i, "Suitability": CLASS_INFO[i]["name"], "Pixels": count, "Area_km2": area_km2})
+        rows.append({"Class": i, "Suitability": CLASS_INFO[i]["name"], "Pixels": count, "Area_sq_km": area_km2})
     df = pd.DataFrame(rows)
+    total_area = df["Area_sq_km"].sum()
+    if total_area > 0:
+        df["Area_percent"] = df["Area_sq_km"] / total_area * 100
+    else:
+        df["Area_percent"] = 0.0
+    df["Area_sq_km"] = df["Area_sq_km"].round(3)
+    df["Area_percent"] = df["Area_percent"].round(2)
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.bar(df["Suitability"], df["Area_km2"])
+    ax.bar(df["Suitability"], df["Area_sq_km"])
     ax.set_ylabel("Area (sq. km)")
     ax.set_xlabel("Suitability class")
     ax.set_title("Area under each suitability class")
-    ax.tick_params(axis="x", rotation=35)
+    ax.tick_params(axis="x", rotation=25)
     fig.tight_layout()
     return df, fig
 
@@ -376,7 +549,6 @@ def extract_zip_to_temp(uploaded_zip, out_dir: str) -> str:
         z.extractall(extract_dir)
     shp_files = [os.path.join(extract_dir, f) for f in os.listdir(extract_dir) if f.lower().endswith(".shp")]
     if not shp_files:
-        # Search recursively if shapefile is inside a folder.
         shp_files = [str(p) for p in Path(extract_dir).rglob("*.shp")]
     if not shp_files:
         raise ValueError("No .shp file found in the uploaded ZIP.")
@@ -446,6 +618,37 @@ def figure_to_png_bytes(fig) -> bytes:
     return bio.read()
 
 
+def auto_detect_column(columns, candidates):
+    lower_map = {str(c).lower().strip(): c for c in columns}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    for c in columns:
+        c_low = str(c).lower()
+        for cand in candidates:
+            if cand.lower() in c_low:
+                return c
+    return columns[0] if len(columns) else None
+
+
+def prepare_spring_csv_for_map(df: pd.DataFrame, x_col: str, y_col: str, coord_mode: str, ref_meta: dict):
+    out = df.copy()
+    xs = pd.to_numeric(out[x_col], errors="coerce")
+    ys = pd.to_numeric(out[y_col], errors="coerce")
+
+    if coord_mode == "Same CRS as raster":
+        transformer = Transformer.from_crs(ref_meta["crs"], "EPSG:4326", always_xy=True)
+        lon, lat = transformer.transform(xs.values, ys.values)
+    else:
+        lon, lat = xs.values, ys.values
+
+    out["_map_lon"] = lon
+    out["_map_lat"] = lat
+    out = out[np.isfinite(out["_map_lon"]) & np.isfinite(out["_map_lat"])].copy()
+    out = out[(out["_map_lat"].between(-90, 90)) & (out["_map_lon"].between(-180, 180))].copy()
+    return out
+
+
 # -----------------------------
 # Header
 # -----------------------------
@@ -453,7 +656,7 @@ st.title("💧 Geo-RWH-SRP+ Dashboard")
 st.markdown(
     """
     **A Smart GIS Web Portal for Rainwater Harvesting and Spring Rejuvenation Planning**  
-    Upload classified factor rasters, assign weights, run weighted overlay, classify suitability, map the result, and validate using spring/non-spring point data.
+    Upload classified factor rasters, use AHP/default weights, run weighted overlay, classify suitability, display spring locations, and validate using spring/non-spring point data.
     """
 )
 
@@ -489,17 +692,21 @@ for spec in FACTOR_SPECS:
 
 st.sidebar.divider()
 st.sidebar.header("2. Factor weights")
-st.sidebar.caption("Weights are automatically normalized before weighted overlay.")
+st.sidebar.caption("Default AHP weights are from the uploaded table. Values are normalized automatically.")
 
 for spec in FACTOR_SPECS:
     weights[spec["key"]] = st.sidebar.slider(
         spec["label"],
-        min_value=0,
-        max_value=100,
-        value=10,
-        step=1,
+        min_value=0.00,
+        max_value=100.00,
+        value=float(DEFAULT_WEIGHTS[spec["key"]]),
+        step=0.01,
+        format="%.2f",
         key=f"wt_{spec['key']}",
     )
+
+weight_total = sum(weights.values())
+st.sidebar.caption(f"Current raw weight total: **{weight_total:.2f}**")
 
 with st.sidebar.expander("Advanced raster options", expanded=False):
     clean_to_1_5 = st.checkbox("Treat all values outside 1-5 as NoData", value=True)
@@ -511,7 +718,6 @@ with st.sidebar.expander("Advanced raster options", expanded=False):
         ],
         index=0,
     )
-    class_method = st.radio("Classification method", ["Equal interval", "Quantile"], index=0)
     st.markdown("**Invert 1-5 suitability scale if any input layer is reversed**")
     for spec in FACTOR_SPECS:
         invert_flags[spec["key"]] = st.checkbox(f"Invert {spec['label']}", value=False, key=f"inv_{spec['key']}")
@@ -554,19 +760,7 @@ if run_button or all_uploaded:
 
             norm_w = normalize_weights(weights)
             score = weighted_overlay(arrays, norm_w, missing_policy=missing_policy)
-            class_array, thresholds = classify_suitability(score, method=class_method)
 
-            out_score_tif = os.path.join(work_dir, "Geo_RWH_SRP_weighted_suitability_score.tif")
-            out_class_tif = os.path.join(work_dir, "Geo_RWH_SRP_suitability_classes.tif")
-            out_class_png = os.path.join(work_dir, "Geo_RWH_SRP_suitability_overlay.png")
-
-            write_geotiff(out_score_tif, score, ref_meta, dtype="float32", nodata=-9999)
-            write_geotiff(out_class_tif, class_array, ref_meta, dtype="uint8", nodata=0)
-            create_class_png(class_array, out_class_png)
-
-        # -----------------------------
-        # Results summary
-        # -----------------------------
         st.success("Weighted overlay completed successfully.")
 
         c1, c2, c3, c4 = st.columns(4)
@@ -583,7 +777,7 @@ if run_button or all_uploaded:
             [
                 {
                     "Factor": next(s["label"] for s in FACTOR_SPECS if s["key"] == k),
-                    "Raw weight": weights[k],
+                    "Raw weight (%)": round(weights[k], 2),
                     "Normalized weight": round(v, 4),
                     "Percent contribution": round(v * 100, 2),
                 }
@@ -592,17 +786,76 @@ if run_button or all_uploaded:
         )
         st.dataframe(wdf, use_container_width=True, hide_index=True)
 
-        st.subheader("Classification thresholds")
+        # -----------------------------
+        # Threshold and classification controls
+        # -----------------------------
+        st.subheader("Classification threshold setting")
+        class_method = st.radio(
+            "Select class threshold method",
+            ["Equal interval", "Quantile", "Jenks natural breaks", "Manual edit"],
+            horizontal=True,
+            index=2,
+            help="Jenks natural breaks is selected by default. Manual edit allows you to define all three breaks for the four-class map.",
+        )
+
+        score_min = float(np.nanmin(score))
+        score_max = float(np.nanmax(score))
+
+        if class_method == "Manual edit":
+            default_manual = calculate_thresholds(score, "Jenks natural breaks")
+            st.caption("Enter three increasing threshold values. The four classes will be: ≤B1, B1–B2, B2–B3, and >B3.")
+            bcol1, bcol2, bcol3 = st.columns(3)
+            b1 = bcol1.number_input(
+                "Break 1: Unsuitable upper limit",
+                min_value=score_min,
+                max_value=score_max,
+                value=float(default_manual[0]),
+                step=0.01,
+                format="%.2f",
+            )
+            b2 = bcol2.number_input(
+                "Break 2: Moderate upper limit",
+                min_value=score_min,
+                max_value=score_max,
+                value=float(default_manual[1]),
+                step=0.01,
+                format="%.2f",
+            )
+            b3 = bcol3.number_input(
+                "Break 3: High upper limit",
+                min_value=score_min,
+                max_value=score_max,
+                value=float(default_manual[2]),
+                step=0.01,
+                format="%.2f",
+            )
+            thresholds = np.array([b1, b2, b3], dtype="float64")
+        else:
+            thresholds = calculate_thresholds(score, class_method)
+
+        if not (thresholds[0] < thresholds[1] < thresholds[2]):
+            st.error("Thresholds must be in increasing order: Break 1 < Break 2 < Break 3.")
+            st.stop()
+
+        class_array = classify_suitability(score, thresholds)
+
+        out_score_tif = os.path.join(work_dir, "Geo_RWH_SRP_weighted_suitability_score.tif")
+        out_class_tif = os.path.join(work_dir, "Geo_RWH_SRP_suitability_classes_4class.tif")
+        out_class_png = os.path.join(work_dir, "Geo_RWH_SRP_suitability_overlay_4class.png")
+
+        write_geotiff(out_score_tif, score, ref_meta, dtype="float32", nodata=-9999)
+        write_geotiff(out_class_tif, class_array, ref_meta, dtype="uint8", nodata=0)
+        create_class_png(class_array, out_class_png)
+
         th_df = pd.DataFrame(
             {
-                "Class": [1, 2, 3, 4, 5],
-                "Suitability": [CLASS_INFO[i]["name"] for i in [1, 2, 3, 4, 5]],
+                "Class": [1, 2, 3, 4],
+                "Suitability": [CLASS_INFO[i]["name"] for i in [1, 2, 3, 4]],
                 "Score interval": [
-                    f"≤ {thresholds[0]:.3f}",
-                    f"> {thresholds[0]:.3f} to ≤ {thresholds[1]:.3f}",
-                    f"> {thresholds[1]:.3f} to ≤ {thresholds[2]:.3f}",
-                    f"> {thresholds[2]:.3f} to ≤ {thresholds[3]:.3f}",
-                    f"> {thresholds[3]:.3f}",
+                    f"≤ {thresholds[0]:.2f}",
+                    f"> {thresholds[0]:.2f} to ≤ {thresholds[1]:.2f}",
+                    f"> {thresholds[1]:.2f} to ≤ {thresholds[2]:.2f}",
+                    f"> {thresholds[2]:.2f}",
                 ],
             }
         )
@@ -612,16 +865,58 @@ if run_button or all_uploaded:
         # Map and area statistics
         # -----------------------------
         tab_map, tab_stats, tab_validation, tab_download = st.tabs(
-            ["🗺️ Suitability Map", "📊 Area Statistics", "✅ ROC/AUC Validation", "⬇️ Downloads"]
+            ["🗺️ Final Suitability Map", "📊 Area Statistics", "✅ ROC/AUC Validation", "⬇️ Downloads"]
         )
 
         with tab_map:
-            st.subheader("RWH and Spring Rejuvenation Suitability Map")
-            m = make_folium_map(out_class_png, ref_meta)
-            st_folium(m, width=None, height=650)
-            st.caption("The map includes a class legend, north arrow, scale bar, coordinate display and measuring tool.")
+            st.subheader("Final RWH and Spring Rejuvenation Suitability Map")
+            st.markdown("Upload a spring-location CSV if you want to display spring points on the final map.")
+            springs_df_for_map = None
+            label_col = None
+
+            springs_csv = st.file_uploader(
+                "Upload springs location CSV for map display",
+                type=["csv"],
+                key="springs_location_csv",
+                help="CSV should contain coordinate columns such as latitude/longitude or x/y.",
+            )
+            if springs_csv is not None:
+                try:
+                    spring_df = pd.read_csv(springs_csv)
+                    if spring_df.empty:
+                        st.warning("Uploaded spring CSV is empty.")
+                    else:
+                        numeric_cols = list(spring_df.columns)
+                        default_x = auto_detect_column(numeric_cols, ["longitude", "lon", "long", "x", "easting"])
+                        default_y = auto_detect_column(numeric_cols, ["latitude", "lat", "y", "northing"])
+                        map_cols = st.columns(4)
+                        x_col = map_cols[0].selectbox("Longitude/X column", numeric_cols, index=numeric_cols.index(default_x))
+                        y_col = map_cols[1].selectbox("Latitude/Y column", numeric_cols, index=numeric_cols.index(default_y))
+                        coord_mode = map_cols[2].selectbox(
+                            "CSV coordinate system",
+                            ["Latitude/Longitude (EPSG:4326)", "Same CRS as raster"],
+                            index=0,
+                        )
+                        label_options = ["None"] + numeric_cols
+                        label_guess = auto_detect_column(numeric_cols, ["name", "id", "spring", "site"])
+                        label_index = label_options.index(label_guess) if label_guess in label_options else 0
+                        label_selected = map_cols[3].selectbox("Point label column", label_options, index=label_index)
+                        label_col = None if label_selected == "None" else label_selected
+
+                        springs_df_for_map = prepare_spring_csv_for_map(spring_df, x_col, y_col, coord_mode, ref_meta)
+                        st.success(f"{len(springs_df_for_map):,} spring location point(s) will be shown on the map.")
+                        with st.expander("Preview spring CSV points", expanded=False):
+                            st.dataframe(springs_df_for_map.head(20), use_container_width=True)
+                except Exception as e:
+                    st.warning("Spring CSV could not be displayed on the map. Please check coordinate columns.")
+                    st.exception(e)
+
+            m = make_folium_map(out_class_png, ref_meta, springs_df=springs_df_for_map, label_col=label_col)
+            st_folium(m, width=None, height=680)
+            st.caption("The map includes four suitability classes, dark legend font, north arrow, scale bar, coordinate display, measuring tool and optional spring CSV points.")
 
         with tab_stats:
+            st.subheader("Area statistics")
             area_df, area_fig = plot_area_chart(class_array, pixel_area_m2)
             st.dataframe(area_df, use_container_width=True, hide_index=True)
             st.pyplot(area_fig, clear_figure=False)
@@ -682,9 +977,8 @@ if run_button or all_uploaded:
                                 st.metric("AUC", f"{auc:.3f}")
                                 st.pyplot(roc_fig, clear_figure=False)
 
-                                # Optional binary evaluation using suitability threshold >= 3.4, i.e. high and very high.
-                                st.markdown("**Binary validation using classes 4 and 5 as suitable**")
-                                y_pred = (valid_sampled["suit_class"] >= 4).astype(int).values
+                                st.markdown("**Binary validation using classes 3 and 4 as suitable**")
+                                y_pred = (valid_sampled["suit_class"] >= 3).astype(int).values
                                 y_true = valid_sampled["y_true"].values
                                 cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
                                 cm_df = pd.DataFrame(
@@ -728,17 +1022,17 @@ if run_button or all_uploaded:
                 )
             with open(out_class_tif, "rb") as f:
                 st.download_button(
-                    "Download classified suitability GeoTIFF",
+                    "Download classified suitability GeoTIFF - 4 classes",
                     data=f.read(),
-                    file_name="Geo_RWH_SRP_suitability_classes.tif",
+                    file_name="Geo_RWH_SRP_suitability_classes_4class.tif",
                     mime="image/tiff",
                     use_container_width=True,
                 )
             with open(out_class_png, "rb") as f:
                 st.download_button(
-                    "Download map overlay PNG",
+                    "Download map overlay PNG - 4 classes",
                     data=f.read(),
-                    file_name="Geo_RWH_SRP_suitability_overlay.png",
+                    file_name="Geo_RWH_SRP_suitability_overlay_4class.png",
                     mime="image/png",
                     use_container_width=True,
                 )
@@ -749,6 +1043,21 @@ if run_button or all_uploaded:
                 mime="text/csv",
                 use_container_width=True,
             )
+            st.download_button(
+                "Download class threshold CSV",
+                data=dataframe_to_csv_download(th_df),
+                file_name="Geo_RWH_SRP_class_thresholds.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            if "area_df" in locals():
+                st.download_button(
+                    "Download area statistics CSV",
+                    data=dataframe_to_csv_download(area_df),
+                    file_name="Geo_RWH_SRP_area_statistics.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
     except Exception as e:
         st.error("Processing failed. Please check that all rasters are valid GeoTIFFs and have proper CRS information.")
