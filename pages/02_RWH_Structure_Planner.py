@@ -2,6 +2,9 @@
 # Geo-RWH-SRP+ : RWH Structure Recommendation Page
 # Add this file inside a Streamlit app folder as:
 #   pages/02_RWH_Structure_Planner.py
+# New feature:
+#   Optional High + Very High suitability GeoTIFF from the main dashboard
+#   can be uploaded to restrict structure recommendations only to priority zones.
 # ================================================================
 
 import io
@@ -280,6 +283,30 @@ def prepare_stream_order(stream_order: np.ndarray, max_order: int = 4) -> np.nda
     return out.astype("uint8")
 
 
+def read_high_very_high_suitability_filter(src_path: str, ref_meta: dict) -> np.ndarray:
+    """Read and align a High + Very High suitability filter raster.
+
+    Accepted inputs from the first Geo-RWH-SRP+ app:
+    1. Binary mask: 1 = High/Very High, 0 = other.
+    2. High/Very High class raster: 3 = High, 4 = Very High, 0 = other.
+    3. Full four-class suitability raster: 1, 2, 3, 4; classes 3 and 4 are retained.
+    """
+    arr = read_and_align_raw_raster(src_path, ref_meta, resampling_method="nearest")
+    valid = np.isfinite(arr)
+    rounded = np.rint(arr).astype("float32")
+    unique_nonzero = set(int(v) for v in np.unique(rounded[valid & (rounded > 0)]))
+
+    if not unique_nonzero:
+        return np.zeros(arr.shape, dtype=bool)
+
+    # Binary mask exported from the main app contains only value 1 in retained zones.
+    if unique_nonzero.issubset({1}):
+        return (valid & (rounded == 1))
+
+    # Classified suitability rasters retain classes 3 and 4.
+    return (valid & np.isin(rounded, [3, 4]))
+
+
 def recommend_structures(slope_cat: np.ndarray, cn_cat: np.ndarray, lulc_class: np.ndarray, stream_order: np.ndarray) -> np.ndarray:
     """Apply first-match rule priority to create a structure recommendation raster."""
     valid = (slope_cat > 0) & (cn_cat > 0) & (lulc_class > 0) & np.isfinite(stream_order)
@@ -372,36 +399,49 @@ def prepare_spring_csv_for_map(df: pd.DataFrame, x_col: str, y_col: str, coord_m
     return out
 
 
-def add_structure_legend(map_obj):
+def add_structure_legend(map_obj, filter_applied: bool = False):
     import folium
     legend_items = ""
     for rule in STRUCTURE_RULES:
         legend_items += f"""
-        <div style='display:flex;align-items:center;margin-bottom:4px;color:#111111;font-weight:600;'>
-            <span style='background:{rule['color']};width:17px;height:17px;display:inline-block;border:1px solid #333;margin-right:8px;'></span>
-            <span>{rule['code']}. {rule['abbr']} - {rule['name']}</span>
+        <div style='display:flex;align-items:flex-start;margin-bottom:5px;color:#111111;font-weight:700;'>
+            <span style='background:{rule['color']};width:18px;height:18px;min-width:18px;display:inline-block;border:1px solid #222;margin-right:8px;'></span>
+            <span><b>{rule['code']}. {rule['abbr']}</b> - {rule['name']}</span>
+        </div>
+        """
+
+    filter_note = ""
+    if filter_applied:
+        filter_note = """
+        <div style='margin-bottom:8px;padding:7px;border:1px solid #2e7d32;background:#e8f5e9;color:#111111;font-weight:800;border-radius:5px;'>
+            Filter active: structures shown only inside High + Very High suitability zones.
         </div>
         """
 
     legend_html = f"""
     <div style="
         position: fixed;
-        bottom: 32px;
-        left: 32px;
+        bottom: 30px;
+        left: 30px;
         z-index: 9999;
-        background: rgba(255,255,255,0.96);
+        background: rgba(255,255,255,0.97);
         color: #111111;
         padding: 12px 14px;
-        border: 2px solid #333333;
+        border: 2px solid #222222;
         border-radius: 8px;
         font-size: 12px;
-        max-height: 340px;
+        max-height: 390px;
+        max-width: 430px;
         overflow-y: auto;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.30);
         font-family: Arial, sans-serif;
     ">
-        <div style="font-weight:800;color:#111111;margin-bottom:7px;">Recommended RWH Structures</div>
+        <div style="font-weight:900;color:#111111;margin-bottom:8px;font-size:14px;">Recommended RWH Structure Legend</div>
+        {filter_note}
         {legend_items}
+        <div style='margin-top:8px;padding-top:7px;border-top:1px solid #777;color:#111111;font-weight:700;'>
+            Transparent / no colour = no rule match or outside selected suitability zone.
+        </div>
     </div>
     """
     map_obj.get_root().html.add_child(folium.Element(legend_html))
@@ -432,7 +472,7 @@ def add_north_arrow(map_obj):
     map_obj.get_root().html.add_child(folium.Element(north_html))
 
 
-def make_structure_map(structure_png: str, ref_meta: dict, springs_df: pd.DataFrame | None = None, label_col: str | None = None):
+def make_structure_map(structure_png: str, ref_meta: dict, springs_df: pd.DataFrame | None = None, label_col: str | None = None, filter_applied: bool = False):
     import folium
     from folium.plugins import Fullscreen, MarkerCluster, MeasureControl, MousePosition
 
@@ -490,7 +530,7 @@ def make_structure_map(structure_png: str, ref_meta: dict, springs_df: pd.DataFr
     Fullscreen(position="topright").add_to(m)
     MeasureControl(position="topleft", primary_length_unit="kilometers").add_to(m)
     MousePosition(position="bottomright", separator=" | ", prefix="Lat/Lon:").add_to(m)
-    add_structure_legend(m)
+    add_structure_legend(m, filter_applied=filter_applied)
     add_north_arrow(m)
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -527,7 +567,7 @@ def dataframe_to_csv_download(df: pd.DataFrame) -> bytes:
 st.title("🏗️ RWH Structure Recommendation Planner")
 st.markdown(
     """
-    This page recommends the **type of Rainwater Harvesting / Spring Rejuvenation structure** for each pixel based on raw **Slope**, **Curve Number**, **LULC**, and **Stream Order** layers.
+    This page recommends the **type of Rainwater Harvesting / Spring Rejuvenation structure** for each pixel based on raw **Slope**, **Curve Number**, **LULC**, and **Stream Order** layers. It can also restrict final recommendations to the **High + Very High suitability zones** exported from the main Geo-RWH-SRP+ suitability app.
     """
 )
 
@@ -566,6 +606,21 @@ slope_file = st.sidebar.file_uploader("Upload raw slope raster", type=["tif", "t
 cn_file = st.sidebar.file_uploader("Upload raw Curve Number raster", type=["tif", "tiff"], key="raw_cn")
 lulc_file = st.sidebar.file_uploader("Upload LULC class raster", type=["tif", "tiff"], key="raw_lulc")
 stream_file = st.sidebar.file_uploader("Upload stream order raster", type=["tif", "tiff"], key="raw_stream_order")
+
+st.sidebar.divider()
+st.sidebar.header("Suitability-zone filter")
+st.sidebar.caption("Use the High + Very High suitability GeoTIFF exported from the main dashboard to retain only priority zones.")
+suitability_filter_file = st.sidebar.file_uploader(
+    "Upload High + Very High suitability GeoTIFF",
+    type=["tif", "tiff"],
+    key="high_very_high_filter",
+    help="Accepted: binary mask with value 1, High/VH class raster with values 3 and 4, or full 4-class suitability raster.",
+)
+apply_suitability_filter = st.sidebar.checkbox(
+    "Filter structures using High + Very High suitability zone",
+    value=True,
+    help="When checked, recommendations outside the uploaded High + Very High suitability zone are removed.",
+)
 
 assume_zero_stream = st.sidebar.checkbox(
     "If stream order raster is not uploaded, assume stream order = 0 everywhere",
@@ -621,16 +676,31 @@ if run or (slope_file and cn_file and lulc_file and (stream_file or assume_zero_
             lulc_class = prepare_lulc(lulc_raw)
             stream_order = prepare_stream_order(stream_raw)
 
-            structure = recommend_structures(slope_cat, cn_cat, lulc_class, stream_order)
+            structure_unfiltered = recommend_structures(slope_cat, cn_cat, lulc_class, stream_order)
 
-            out_structure_tif = os.path.join(work_dir, "Geo_RWH_SRP_recommended_RWH_structures.tif")
+            filter_applied = False
+            high_very_high_filter = None
+            if suitability_filter_file is not None and apply_suitability_filter:
+                suitability_filter_path = save_uploaded_file(suitability_filter_file, work_dir, "high_very_high_filter_")
+                high_very_high_filter = read_high_very_high_suitability_filter(suitability_filter_path, ref_meta)
+                structure = np.where(high_very_high_filter, structure_unfiltered, 0).astype("uint8")
+                filter_applied = True
+            else:
+                structure = structure_unfiltered.copy()
+
+            out_structure_tif = os.path.join(work_dir, "Geo_RWH_SRP_recommended_RWH_structures_FILTERED.tif")
+            out_structure_unfiltered_tif = os.path.join(work_dir, "Geo_RWH_SRP_recommended_RWH_structures_unfiltered.tif")
             out_slope_cat_tif = os.path.join(work_dir, "Geo_RWH_SRP_slope_categories.tif")
             out_cn_cat_tif = os.path.join(work_dir, "Geo_RWH_SRP_CN_categories.tif")
-            out_structure_png = os.path.join(work_dir, "Geo_RWH_SRP_recommended_RWH_structures_overlay.png")
+            out_filter_tif = os.path.join(work_dir, "Geo_RWH_SRP_uploaded_high_very_high_filter_aligned.tif")
+            out_structure_png = os.path.join(work_dir, "Geo_RWH_SRP_recommended_RWH_structures_FILTERED_overlay.png")
 
             write_geotiff(out_structure_tif, structure, ref_meta, dtype="uint8", nodata=0)
+            write_geotiff(out_structure_unfiltered_tif, structure_unfiltered, ref_meta, dtype="uint8", nodata=0)
             write_geotiff(out_slope_cat_tif, slope_cat, ref_meta, dtype="uint8", nodata=0)
             write_geotiff(out_cn_cat_tif, cn_cat, ref_meta, dtype="uint8", nodata=0)
+            if filter_applied and high_very_high_filter is not None:
+                write_geotiff(out_filter_tif, high_very_high_filter.astype("uint8"), ref_meta, dtype="uint8", nodata=0)
             create_structure_png(structure, out_structure_png)
 
         st.success("RWH structure recommendation completed successfully.")
@@ -638,12 +708,23 @@ if run or (slope_file and cn_file and lulc_file and (stream_file or assume_zero_
         pixel_area_m2 = abs(ref_meta["transform"].a * ref_meta["transform"].e)
         total_rec_pixels = int(np.sum(structure > 0))
         total_rec_area_km2 = total_rec_pixels * pixel_area_m2 / 1_000_000
+        total_potential_pixels = int(np.sum(structure_unfiltered > 0))
+        removed_pixels = max(total_potential_pixels - total_rec_pixels, 0)
+        removed_area_km2 = removed_pixels * pixel_area_m2 / 1_000_000
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pixels with recommendation", f"{total_rec_pixels:,}")
-        c2.metric("Recommended area", f"{total_rec_area_km2:,.2f} sq. km")
-        c3.metric("Structure types found", f"{len(np.unique(structure[structure > 0]))}")
+        c1.metric("Final recommended pixels", f"{total_rec_pixels:,}")
+        c2.metric("Final recommended area", f"{total_rec_area_km2:,.2f} sq. km")
+        c3.metric("Structure types shown", f"{len(np.unique(structure[structure > 0]))}")
         c4.metric("Raster size", f"{ref_meta['width']} × {ref_meta['height']}")
+
+        if filter_applied:
+            st.info(
+                f"Suitability filter applied: recommendations are retained only within uploaded High + Very High suitable zones. "
+                f"Removed {removed_pixels:,} potential structure pixels ({removed_area_km2:,.2f} sq. km) outside the priority suitability zone."
+            )
+        else:
+            st.warning("No High + Very High suitability filter is active. The structure map is based only on Slope, CN, LULC and Stream Order rules.")
 
         tab_map, tab_stats, tab_categories, tab_download = st.tabs(
             ["🗺️ Structure Map", "📊 Structure Area Statistics", "🧩 Category Summary", "⬇️ Downloads"]
@@ -686,13 +767,15 @@ if run or (slope_file and cn_file and lulc_file and (stream_file or assume_zero_
                     st.exception(e)
 
             from streamlit_folium import st_folium
-            fmap = make_structure_map(out_structure_png, ref_meta, springs_df=springs_df_for_map, label_col=label_col)
+            fmap = make_structure_map(out_structure_png, ref_meta, springs_df=springs_df_for_map, label_col=label_col, filter_applied=filter_applied)
             st_folium(fmap, width=None, height=720)
-            st.caption("The map includes recommended structure classes, dark legend, north arrow, scale bar, coordinate display and measuring tool.")
+            st.caption("The map includes all recommended structure classes with a dark-font legend, optional High + Very High suitability filtering, north arrow, scale bar, coordinate display and measuring tool.")
 
         with tab_stats:
             st.subheader("Area statistics of recommended structures")
             stats_df = structure_area_statistics(structure, pixel_area_m2)
+            if filter_applied:
+                st.success("Area statistics below are calculated only for structures retained inside High + Very High suitability zones.")
             st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
             try:
@@ -752,17 +835,34 @@ if run or (slope_file and cn_file and lulc_file and (stream_file or assume_zero_
             st.subheader("Download structure recommendation outputs")
             with open(out_structure_tif, "rb") as f:
                 st.download_button(
-                    "Download recommended RWH structures GeoTIFF",
+                    "Download final recommended RWH structures GeoTIFF",
                     data=f.read(),
-                    file_name="Geo_RWH_SRP_recommended_RWH_structures.tif",
+                    file_name="Geo_RWH_SRP_recommended_RWH_structures_FILTERED.tif" if filter_applied else "Geo_RWH_SRP_recommended_RWH_structures.tif",
                     mime="image/tiff",
                     use_container_width=True,
                 )
+            if filter_applied:
+                with open(out_structure_unfiltered_tif, "rb") as f:
+                    st.download_button(
+                        "Download unfiltered rule-based structures GeoTIFF",
+                        data=f.read(),
+                        file_name="Geo_RWH_SRP_recommended_RWH_structures_unfiltered.tif",
+                        mime="image/tiff",
+                        use_container_width=True,
+                    )
+                with open(out_filter_tif, "rb") as f:
+                    st.download_button(
+                        "Download aligned High + Very High filter GeoTIFF",
+                        data=f.read(),
+                        file_name="Geo_RWH_SRP_uploaded_high_very_high_filter_aligned.tif",
+                        mime="image/tiff",
+                        use_container_width=True,
+                    )
             with open(out_structure_png, "rb") as f:
                 st.download_button(
-                    "Download recommended structures map overlay PNG",
+                    "Download final recommended structures map overlay PNG",
                     data=f.read(),
-                    file_name="Geo_RWH_SRP_recommended_RWH_structures_overlay.png",
+                    file_name="Geo_RWH_SRP_recommended_RWH_structures_FILTERED_overlay.png" if filter_applied else "Geo_RWH_SRP_recommended_RWH_structures_overlay.png",
                     mime="image/png",
                     use_container_width=True,
                 )
