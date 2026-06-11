@@ -28,17 +28,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import rasterio
-from rasterio.warp import reproject, Resampling, transform_bounds
-from rasterio.transform import rowcol
-import geopandas as gpd
-import folium
-from folium.plugins import Fullscreen, MeasureControl, MousePosition, MarkerCluster
-from streamlit_folium import st_folium
-import matplotlib.pyplot as plt
-from PIL import Image
-from pyproj import Transformer
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, classification_report
+
+# Heavy GIS/plotting packages are imported lazily inside functions.
+# This allows Streamlit Cloud to show the page immediately instead of staying blank
+# while rasterio/geopandas/folium/matplotlib import at startup.
 
 
 # -----------------------------
@@ -116,6 +109,7 @@ def save_uploaded_file(uploaded_file, out_dir: str, name_prefix: str = "") -> st
 
 def get_reference_profile(ref_path: str):
     """Read reference raster metadata."""
+    import rasterio
     with rasterio.open(ref_path) as src:
         profile = src.profile.copy()
         meta = {
@@ -142,6 +136,9 @@ def read_and_align_raster(
     Classified rasters are expected to use values 1-5, where 5 = highly suitable.
     Values outside 1-5 can be treated as NoData.
     """
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+
     dst_shape = (ref_meta["height"], ref_meta["width"])
     dst = np.full(dst_shape, np.nan, dtype="float32")
 
@@ -368,6 +365,7 @@ def classify_suitability(score: np.ndarray, thresholds):
 
 
 def write_geotiff(out_path: str, arr: np.ndarray, ref_meta: dict, dtype: str, nodata):
+    import rasterio
     profile = ref_meta["profile"].copy()
     profile.update(
         driver="GTiff",
@@ -393,6 +391,7 @@ def write_geotiff(out_path: str, arr: np.ndarray, ref_meta: dict, dtype: str, no
 
 def create_class_png(class_array: np.ndarray, out_png: str):
     """Create transparent PNG overlay from classified array."""
+    from PIL import Image
     safe_cls = np.nan_to_num(class_array, nan=0).astype("uint8")
     safe_cls = np.clip(safe_cls, 0, 4)
     rgba = CLASS_RGBA[safe_cls]
@@ -401,6 +400,7 @@ def create_class_png(class_array: np.ndarray, out_png: str):
 
 
 def add_legend(map_obj):
+    import folium
     legend_items = "".join(
         [
             f"""
@@ -436,6 +436,7 @@ def add_legend(map_obj):
 
 
 def add_north_arrow(map_obj):
+    import folium
     north_html = """
     <div style="
         position: fixed;
@@ -460,6 +461,7 @@ def add_north_arrow(map_obj):
 
 
 def raster_bounds_wgs84(ref_meta: dict):
+    from rasterio.warp import transform_bounds
     bounds_wgs84 = transform_bounds(
         ref_meta["crs"],
         "EPSG:4326",
@@ -475,6 +477,8 @@ def raster_bounds_wgs84(ref_meta: dict):
 
 def make_folium_map(class_png: str, ref_meta: dict, springs_df: pd.DataFrame | None = None, label_col: str | None = None):
     """Build interactive folium map with overlay, legend, north arrow, scale and optional spring CSV points."""
+    import folium
+    from folium.plugins import Fullscreen, MeasureControl, MousePosition, MarkerCluster
     west, south, east, north = raster_bounds_wgs84(ref_meta)
     center = [(south + north) / 2, (west + east) / 2]
 
@@ -544,6 +548,7 @@ def make_folium_map(class_png: str, ref_meta: dict, springs_df: pd.DataFrame | N
 
 
 def plot_area_chart(class_array: np.ndarray, pixel_area_m2: float):
+    import matplotlib.pyplot as plt
     rows = []
     for i in [1, 2, 3, 4]:
         count = int(np.sum(class_array == i))
@@ -582,7 +587,8 @@ def extract_zip_to_temp(uploaded_zip, out_dir: str) -> str:
     return shp_files[0]
 
 
-def sample_scores_at_points(gdf: gpd.GeoDataFrame, score: np.ndarray, class_array: np.ndarray, ref_meta: dict):
+def sample_scores_at_points(gdf, score: np.ndarray, class_array: np.ndarray, ref_meta: dict):
+    from rasterio.transform import rowcol
     if gdf.crs is None:
         raise ValueError("Validation shapefile has no CRS. Please define its projection before uploading.")
 
@@ -619,6 +625,8 @@ def sample_scores_at_points(gdf: gpd.GeoDataFrame, score: np.ndarray, class_arra
 
 
 def create_roc_plot(y_true, y_score):
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_auc_score, roc_curve
     auc = roc_auc_score(y_true, y_score)
     fpr, tpr, thresholds = roc_curve(y_true, y_score)
 
@@ -659,6 +667,7 @@ def auto_detect_column(columns, candidates):
 
 
 def prepare_spring_csv_for_map(df: pd.DataFrame, x_col: str, y_col: str, coord_mode: str, ref_meta: dict):
+    from pyproj import Transformer
     out = df.copy()
     xs = pd.to_numeric(out[x_col], errors="coerce")
     ys = pd.to_numeric(out[y_col], errors="coerce")
@@ -680,6 +689,7 @@ def prepare_spring_csv_for_map(df: pd.DataFrame, x_col: str, y_col: str, coord_m
 # Header
 # -----------------------------
 st.title("💧 Geo-RWH-SRP+ Dashboard")
+st.caption("Cloud-safe build: heavy GIS libraries load only after raster upload/processing starts.")
 st.markdown(
     """
     **A Smart GIS Web Portal for Rainwater Harvesting and Spring Rejuvenation Planning**  
@@ -944,6 +954,7 @@ if run_button or all_uploaded:
                     st.warning("Spring CSV could not be displayed on the map. Please check coordinate columns.")
                     st.exception(e)
 
+            from streamlit_folium import st_folium
             m = make_folium_map(out_class_png, ref_meta, springs_df=springs_df_for_map, label_col=label_col)
             st_folium(m, width=None, height=680)
             st.caption("The map includes four suitability classes, dark legend font, north arrow, scale bar, coordinate display, measuring tool and optional spring CSV points.")
@@ -964,6 +975,7 @@ if run_button or all_uploaded:
 
             if val_zip is not None:
                 try:
+                    import geopandas as gpd
                     shp_path = extract_zip_to_temp(val_zip, work_dir)
                     gdf = gpd.read_file(shp_path)
 
@@ -1013,6 +1025,7 @@ if run_button or all_uploaded:
                                 st.markdown("**Binary validation using classes 3 and 4 as suitable**")
                                 y_pred = (valid_sampled["suit_class"] >= 3).astype(int).values
                                 y_true = valid_sampled["y_true"].values
+                                from sklearn.metrics import confusion_matrix, classification_report
                                 cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
                                 cm_df = pd.DataFrame(
                                     cm,
