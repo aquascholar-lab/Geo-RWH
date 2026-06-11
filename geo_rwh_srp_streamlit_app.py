@@ -8,9 +8,10 @@
 #   3. Perform weighted overlay
 #   4. Classify final suitability into 4 classes
 #   5. Classification methods: Equal interval, Quantile, Jenks, Manual
-#   6. Interactive map with dark legend, north arrow, scale and spring CSV points
+#   6. Interactive map with improved dark legends, north arrow, scale and spring CSV points
 #   7. Area statistics in sq. km and percentage
-#   8. ROC-AUC validation using spring/non-spring point shapefile ZIP
+#   8. Export High + Very High suitability zones for the structure planner
+#   9. ROC-AUC validation using spring/non-spring point shapefile ZIP
 # ================================================================
 # Run:
 #   conda create -n geo_rwh python=3.10 -y
@@ -399,14 +400,34 @@ def create_class_png(class_array: np.ndarray, out_png: str):
     img.save(out_png)
 
 
-def add_legend(map_obj):
+def add_legend(map_obj, thresholds=None):
+    """Add a clear dark-font suitability legend. When thresholds are provided,
+    score intervals are also shown in the legend.
+    """
     import folium
+
+    interval_text = {
+        1: "Lowest suitability zone",
+        2: "Moderate suitability zone",
+        3: "Suitable zone for planning",
+        4: "Priority zone for planning",
+    }
+    if thresholds is not None and len(thresholds) == 3:
+        b1, b2, b3 = [float(x) for x in thresholds]
+        interval_text = {
+            1: f"Score ≤ {b1:.2f}",
+            2: f"> {b1:.2f} to ≤ {b2:.2f}",
+            3: f"> {b2:.2f} to ≤ {b3:.2f}",
+            4: f"Score > {b3:.2f}",
+        }
+
     legend_items = "".join(
         [
             f"""
-            <div style='display:flex;align-items:center;margin-bottom:5px;color:#111111;font-weight:600;'>
-                <span style='background:{CLASS_INFO[i]['color']};width:18px;height:18px;display:inline-block;border:1px solid #333;margin-right:8px;'></span>
-                <span>{i}. {CLASS_INFO[i]['name']}</span>
+            <div style='display:flex;align-items:flex-start;margin-bottom:7px;color:#111111;font-weight:700;'>
+                <span style='background:{CLASS_INFO[i]['color']};width:20px;height:20px;min-width:20px;display:inline-block;border:1px solid #222;margin-right:9px;'></span>
+                <span><b>Class {i}: {CLASS_INFO[i]['name']}</b><br>
+                <small style='color:#222222;font-weight:600;'>{interval_text[i]}</small></span>
             </div>
             """
             for i in [4, 3, 2, 1]
@@ -419,17 +440,21 @@ def add_legend(map_obj):
         bottom: 32px;
         left: 32px;
         z-index: 9999;
-        background: rgba(255,255,255,0.96);
+        background: rgba(255,255,255,0.97);
         color: #111111;
-        padding: 12px 14px;
-        border: 2px solid #333333;
+        padding: 13px 15px;
+        border: 2px solid #222222;
         border-radius: 8px;
         font-size: 13px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        max-width: 345px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.30);
         font-family: Arial, sans-serif;
     ">
-        <div style="font-weight:800;color:#111111;margin-bottom:7px;">RWH/Spring Rejuvenation Suitability</div>
+        <div style="font-weight:900;color:#111111;margin-bottom:8px;font-size:14px;">Suitability Legend</div>
         {legend_items}
+        <div style="margin-top:7px;padding-top:7px;border-top:1px solid #777;color:#111111;font-weight:800;">
+            Export zone for structure planner: <span style="color:#006400;">Class 3 + Class 4</span>
+        </div>
     </div>
     """
     map_obj.get_root().html.add_child(folium.Element(legend_html))
@@ -475,7 +500,7 @@ def raster_bounds_wgs84(ref_meta: dict):
     return west, south, east, north
 
 
-def make_folium_map(class_png: str, ref_meta: dict, springs_df: pd.DataFrame | None = None, label_col: str | None = None):
+def make_folium_map(class_png: str, ref_meta: dict, springs_df: pd.DataFrame | None = None, label_col: str | None = None, thresholds=None):
     """Build interactive folium map with overlay, legend, north arrow, scale and optional spring CSV points."""
     import folium
     from folium.plugins import Fullscreen, MeasureControl, MousePosition, MarkerCluster
@@ -541,7 +566,7 @@ def make_folium_map(class_png: str, ref_meta: dict, springs_df: pd.DataFrame | N
     Fullscreen(position="topright").add_to(m)
     MeasureControl(position="topleft", primary_length_unit="kilometers").add_to(m)
     MousePosition(position="bottomright", separator=" | ", prefix="Lat/Lon:").add_to(m)
-    add_legend(m)
+    add_legend(m, thresholds=thresholds)
     add_north_arrow(m)
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -571,6 +596,39 @@ def plot_area_chart(class_array: np.ndarray, pixel_area_m2: float):
     ax.tick_params(axis="x", rotation=25)
     fig.tight_layout()
     return df, fig
+
+
+def high_very_high_area_statistics(class_array: np.ndarray, pixel_area_m2: float) -> pd.DataFrame:
+    """Area statistics for the exportable High + Very High suitability zone."""
+    valid_count = int(np.sum(class_array > 0))
+    valid_area_km2 = valid_count * pixel_area_m2 / 1_000_000
+    rows = []
+    for i in [3, 4]:
+        count = int(np.sum(class_array == i))
+        area_km2 = count * pixel_area_m2 / 1_000_000
+        rows.append(
+            {
+                "Zone": CLASS_INFO[i]["name"],
+                "Raster_value_in_class_map": i,
+                "Raster_value_in_binary_mask": 1,
+                "Pixels": count,
+                "Area_sq_km": round(area_km2, 3),
+                "Area_percent_of_valid_area": round((area_km2 / valid_area_km2 * 100) if valid_area_km2 > 0 else 0, 2),
+            }
+        )
+    combined_count = int(np.sum((class_array == 3) | (class_array == 4)))
+    combined_area_km2 = combined_count * pixel_area_m2 / 1_000_000
+    rows.append(
+        {
+            "Zone": "Combined High + Very High Suitable Area",
+            "Raster_value_in_class_map": "3 and 4",
+            "Raster_value_in_binary_mask": 1,
+            "Pixels": combined_count,
+            "Area_sq_km": round(combined_area_km2, 3),
+            "Area_percent_of_valid_area": round((combined_area_km2 / valid_area_km2 * 100) if valid_area_km2 > 0 else 0, 2),
+        }
+    )
+    return pd.DataFrame(rows)
 
 
 def extract_zip_to_temp(uploaded_zip, out_dir: str) -> str:
@@ -885,10 +943,19 @@ if run_button or all_uploaded:
         out_score_tif = os.path.join(work_dir, "Geo_RWH_SRP_weighted_suitability_score.tif")
         out_class_tif = os.path.join(work_dir, "Geo_RWH_SRP_suitability_classes_4class.tif")
         out_class_png = os.path.join(work_dir, "Geo_RWH_SRP_suitability_overlay_4class.png")
+        out_hv_mask_tif = os.path.join(work_dir, "Geo_RWH_SRP_high_very_high_suitable_zone_binary.tif")
+        out_hv_classes_tif = os.path.join(work_dir, "Geo_RWH_SRP_high_very_high_suitable_classes.tif")
+        out_hv_png = os.path.join(work_dir, "Geo_RWH_SRP_high_very_high_suitable_overlay.png")
+
+        high_very_high_mask = np.where((class_array == 3) | (class_array == 4), 1, 0).astype("uint8")
+        high_very_high_classes = np.where((class_array == 3) | (class_array == 4), class_array, 0).astype("uint8")
 
         write_geotiff(out_score_tif, score, ref_meta, dtype="float32", nodata=-9999)
         write_geotiff(out_class_tif, class_array, ref_meta, dtype="uint8", nodata=0)
+        write_geotiff(out_hv_mask_tif, high_very_high_mask, ref_meta, dtype="uint8", nodata=0)
+        write_geotiff(out_hv_classes_tif, high_very_high_classes, ref_meta, dtype="uint8", nodata=0)
         create_class_png(class_array, out_class_png)
+        create_class_png(high_very_high_classes, out_hv_png)
 
         th_df = pd.DataFrame(
             {
@@ -955,15 +1022,20 @@ if run_button or all_uploaded:
                     st.exception(e)
 
             from streamlit_folium import st_folium
-            m = make_folium_map(out_class_png, ref_meta, springs_df=springs_df_for_map, label_col=label_col)
+            m = make_folium_map(out_class_png, ref_meta, springs_df=springs_df_for_map, label_col=label_col, thresholds=thresholds)
             st_folium(m, width=None, height=680)
             st.caption("The map includes four suitability classes, dark legend font, north arrow, scale bar, coordinate display, measuring tool and optional spring CSV points.")
 
         with tab_stats:
             st.subheader("Area statistics")
             area_df, area_fig = plot_area_chart(class_array, pixel_area_m2)
+            hv_area_df = high_very_high_area_statistics(class_array, pixel_area_m2)
+            st.markdown("**All suitability classes**")
             st.dataframe(area_df, use_container_width=True, hide_index=True)
             st.pyplot(area_fig, clear_figure=False)
+            st.markdown("**Exportable High + Very High Suitable Zone for Structure Planner**")
+            st.dataframe(hv_area_df, use_container_width=True, hide_index=True)
+            st.info("Use `Geo_RWH_SRP_high_very_high_suitable_zone_binary.tif` or `Geo_RWH_SRP_high_very_high_suitable_classes.tif` as the suitability filter input in the RWH Structure Planner page.")
 
         with tab_validation:
             st.subheader("Validate with spring and non-spring points")
@@ -1074,6 +1146,32 @@ if run_button or all_uploaded:
                     mime="image/tiff",
                     use_container_width=True,
                 )
+            with open(out_hv_mask_tif, "rb") as f:
+                st.download_button(
+                    "Download High + Very High suitable zone GeoTIFF - binary mask",
+                    data=f.read(),
+                    file_name="Geo_RWH_SRP_high_very_high_suitable_zone_binary.tif",
+                    mime="image/tiff",
+                    use_container_width=True,
+                    help="Use this directly in the RWH Structure Planner page. Value 1 = High or Very High suitable area; 0 = other area.",
+                )
+            with open(out_hv_classes_tif, "rb") as f:
+                st.download_button(
+                    "Download High + Very High suitable classes GeoTIFF - values 3 and 4",
+                    data=f.read(),
+                    file_name="Geo_RWH_SRP_high_very_high_suitable_classes.tif",
+                    mime="image/tiff",
+                    use_container_width=True,
+                    help="Alternative structure-planner input. Value 3 = High; value 4 = Very High; 0 = other area.",
+                )
+            with open(out_hv_png, "rb") as f:
+                st.download_button(
+                    "Download High + Very High suitable overlay PNG",
+                    data=f.read(),
+                    file_name="Geo_RWH_SRP_high_very_high_suitable_overlay.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
             with open(out_class_png, "rb") as f:
                 st.download_button(
                     "Download map overlay PNG - 4 classes",
@@ -1101,6 +1199,14 @@ if run_button or all_uploaded:
                     "Download area statistics CSV",
                     data=dataframe_to_csv_download(area_df),
                     file_name="Geo_RWH_SRP_area_statistics.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            if "hv_area_df" in locals():
+                st.download_button(
+                    "Download High + Very High suitable zone area CSV",
+                    data=dataframe_to_csv_download(hv_area_df),
+                    file_name="Geo_RWH_SRP_high_very_high_suitable_area_statistics.csv",
                     mime="text/csv",
                     use_container_width=True,
                 )
