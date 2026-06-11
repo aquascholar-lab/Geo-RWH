@@ -282,18 +282,45 @@ def _custom_jenks_breaks(values: np.ndarray, n_classes: int = 4, sample_size: in
     return breaks
 
 
-def jenks_thresholds(values: np.ndarray, n_classes: int = 4):
-    """Return internal Jenks thresholds for n_classes."""
+def _sample_for_classification(valid_values: np.ndarray, sample_size: int = 50000) -> np.ndarray:
+    """Return a representative sample for slow classification routines such as Jenks."""
+    valid_values = np.asarray(valid_values, dtype="float64")
+    valid_values = valid_values[np.isfinite(valid_values)]
+    if valid_values.size <= sample_size:
+        return valid_values
+
+    # Random sample + fixed quantiles gives fast and stable breaks for large rasters.
+    rng = np.random.default_rng(42)
+    random_part = rng.choice(valid_values, size=sample_size, replace=False)
+    quantile_part = np.nanpercentile(valid_values, np.linspace(0, 100, 101))
+    sample = np.concatenate([random_part, quantile_part, [np.nanmin(valid_values), np.nanmax(valid_values)]])
+    return sample[np.isfinite(sample)]
+
+
+def jenks_thresholds(values: np.ndarray, n_classes: int = 4, sample_size: int = 50000):
+    """Return internal Jenks thresholds for n_classes.
+
+    Important: Jenks can become very slow on full-resolution rasters with millions
+    of pixels. Therefore, this function always estimates Jenks breaks from a
+    representative sample. This prevents the Streamlit page from freezing.
+    """
     valid_values = values[np.isfinite(values)].astype("float64")
     if valid_values.size == 0:
         raise ValueError("No valid values available for Jenks classification.")
 
-    # Prefer jenkspy if installed because it is faster.
+    sampled_values = _sample_for_classification(valid_values, sample_size=sample_size)
+
+    # Prefer jenkspy if installed, but run it only on the sample.
     try:
         import jenkspy
-        breaks = np.array(jenkspy.jenks_breaks(valid_values, n_classes=n_classes), dtype="float64")
+        try:
+            breaks = np.array(jenkspy.jenks_breaks(sampled_values, n_classes=n_classes), dtype="float64")
+        except TypeError:
+            # Some jenkspy versions use nb_class instead of n_classes.
+            breaks = np.array(jenkspy.jenks_breaks(sampled_values, nb_class=n_classes), dtype="float64")
     except Exception:
-        breaks = _custom_jenks_breaks(valid_values, n_classes=n_classes, sample_size=5000)
+        # Fallback is intentionally smaller because it is O(n²).
+        breaks = _custom_jenks_breaks(sampled_values, n_classes=n_classes, sample_size=5000)
 
     internal = np.array(breaks[1:-1], dtype="float64")
     if len(internal) != n_classes - 1 or len(np.unique(np.round(internal, 8))) != n_classes - 1:
@@ -802,7 +829,8 @@ if run_button or all_uploaded:
         score_max = float(np.nanmax(score))
 
         if class_method == "Manual edit":
-            default_manual = calculate_thresholds(score, "Jenks natural breaks")
+            with st.spinner("Preparing default threshold values..."):
+                default_manual = calculate_thresholds(score, "Jenks natural breaks")
             st.caption("Enter three increasing threshold values. The four classes will be: ≤B1, B1–B2, B2–B3, and >B3.")
             bcol1, bcol2, bcol3 = st.columns(3)
             b1 = bcol1.number_input(
@@ -831,11 +859,16 @@ if run_button or all_uploaded:
             )
             thresholds = np.array([b1, b2, b3], dtype="float64")
         else:
-            thresholds = calculate_thresholds(score, class_method)
+            with st.spinner(f"Calculating {class_method} thresholds..."):
+                thresholds = calculate_thresholds(score, class_method)
 
         if not (thresholds[0] < thresholds[1] < thresholds[2]):
             st.error("Thresholds must be in increasing order: Break 1 < Break 2 < Break 3.")
             st.stop()
+
+        st.caption(
+            f"Thresholds used: {thresholds[0]:.2f}, {thresholds[1]:.2f}, {thresholds[2]:.2f}"
+        )
 
         class_array = classify_suitability(score, thresholds)
 
