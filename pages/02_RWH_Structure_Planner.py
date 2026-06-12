@@ -399,8 +399,56 @@ def prepare_spring_csv_for_map(df: pd.DataFrame, x_col: str, y_col: str, coord_m
     return out
 
 
+def add_leaflet_legend_control(map_obj, title: str, body_html: str, position: str = "bottomleft", width: str = "450px", max_height: str = "430px"):
+    """Add a true Leaflet control legend.
+
+    Using a Leaflet L.control is more reliable inside streamlit-folium than
+    adding a fixed-position HTML block to the Folium root. This prevents the
+    structure legend from disappearing in the rendered Leaflet iframe.
+    """
+    from branca.element import MacroElement, Template
+    import json
+
+    safe_title = json.dumps(title)
+    safe_body = json.dumps(body_html)
+    safe_position = json.dumps(position)
+    safe_width = json.dumps(width)
+    safe_max_height = json.dumps(max_height)
+
+    template = f"""
+    {{% macro script(this, kwargs) %}}
+    var legend = L.control({{position: {safe_position}}});
+    legend.onAdd = function (map) {{
+        var div = L.DomUtil.create('div', 'geo-rwh-structure-legend');
+        div.innerHTML = '<div class="geo-rwh-legend-title">' + {safe_title} + '</div>' + {safe_body};
+        div.style.background = 'rgba(255,255,255,0.97)';
+        div.style.color = '#111111';
+        div.style.padding = '12px 14px';
+        div.style.border = '2px solid #222222';
+        div.style.borderRadius = '8px';
+        div.style.fontSize = '12px';
+        div.style.lineHeight = '1.25';
+        div.style.width = {safe_width};
+        div.style.maxHeight = {safe_max_height};
+        div.style.overflowY = 'auto';
+        div.style.boxShadow = '0 2px 8px rgba(0,0,0,0.30)';
+        div.style.fontFamily = 'Arial, sans-serif';
+        div.style.zIndex = '999999';
+        L.DomEvent.disableClickPropagation(div);
+        L.DomEvent.disableScrollPropagation(div);
+        return div;
+    }};
+    legend.addTo({{{{this._parent.get_name()}}}});
+    {{% endmacro %}}
+    """
+
+    macro = MacroElement()
+    macro._template = Template(template)
+    map_obj.add_child(macro)
+
+
 def add_structure_legend(map_obj, filter_applied: bool = False):
-    import folium
+    """Add a robust Leaflet-control structure legend with all structure classes."""
     legend_items = ""
     for rule in STRUCTURE_RULES:
         legend_items += f"""
@@ -418,33 +466,18 @@ def add_structure_legend(map_obj, filter_applied: bool = False):
         </div>
         """
 
-    legend_html = f"""
-    <div style="
-        position: fixed;
-        bottom: 30px;
-        left: 30px;
-        z-index: 9999;
-        background: rgba(255,255,255,0.97);
-        color: #111111;
-        padding: 12px 14px;
-        border: 2px solid #222222;
-        border-radius: 8px;
-        font-size: 12px;
-        max-height: 390px;
-        max-width: 430px;
-        overflow-y: auto;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.30);
-        font-family: Arial, sans-serif;
-    ">
-        <div style="font-weight:900;color:#111111;margin-bottom:8px;font-size:14px;">Recommended RWH Structure Legend</div>
+    body_html = f"""
         {filter_note}
         {legend_items}
         <div style='margin-top:8px;padding-top:7px;border-top:1px solid #777;color:#111111;font-weight:700;'>
             Transparent / no colour = no rule match or outside selected suitability zone.
         </div>
-    </div>
+        <style>
+            .geo-rwh-legend-title {{font-weight:900;color:#111111;margin-bottom:8px;font-size:14px;}}
+            .geo-rwh-structure-legend, .geo-rwh-structure-legend * {{color:#111111 !important;}}
+        </style>
     """
-    map_obj.get_root().html.add_child(folium.Element(legend_html))
+    add_leaflet_legend_control(map_obj, "Recommended RWH Structure Legend", body_html, position="bottomleft", width="450px", max_height="430px")
 
 
 def add_north_arrow(map_obj):
