@@ -400,12 +400,56 @@ def create_class_png(class_array: np.ndarray, out_png: str):
     img.save(out_png)
 
 
-def add_legend(map_obj, thresholds=None):
-    """Add a clear dark-font suitability legend. When thresholds are provided,
-    score intervals are also shown in the legend.
-    """
-    import folium
+def add_leaflet_legend_control(map_obj, title: str, body_html: str, position: str = "bottomleft", width: str = "360px", max_height: str = "420px"):
+    """Add a true Leaflet control legend.
 
+    Using a Leaflet L.control is more reliable inside streamlit-folium than
+    adding a fixed-position HTML block to the Folium root. This prevents the
+    legend from disappearing in the rendered Leaflet iframe.
+    """
+    from branca.element import MacroElement, Template
+    import json
+
+    safe_title = json.dumps(title)
+    safe_body = json.dumps(body_html)
+    safe_position = json.dumps(position)
+    safe_width = json.dumps(width)
+    safe_max_height = json.dumps(max_height)
+
+    template = f"""
+    {{% macro script(this, kwargs) %}}
+    var legend = L.control({{position: {safe_position}}});
+    legend.onAdd = function (map) {{
+        var div = L.DomUtil.create('div', 'geo-rwh-leaflet-legend');
+        div.innerHTML = '<div class="geo-rwh-legend-title">' + {safe_title} + '</div>' + {safe_body};
+        div.style.background = 'rgba(255,255,255,0.97)';
+        div.style.color = '#111111';
+        div.style.padding = '12px 14px';
+        div.style.border = '2px solid #222222';
+        div.style.borderRadius = '8px';
+        div.style.fontSize = '12px';
+        div.style.lineHeight = '1.25';
+        div.style.width = {safe_width};
+        div.style.maxHeight = {safe_max_height};
+        div.style.overflowY = 'auto';
+        div.style.boxShadow = '0 2px 8px rgba(0,0,0,0.30)';
+        div.style.fontFamily = 'Arial, sans-serif';
+        div.style.zIndex = '999999';
+        L.DomEvent.disableClickPropagation(div);
+        L.DomEvent.disableScrollPropagation(div);
+        return div;
+    }};
+    legend.addTo({{{{this._parent.get_name()}}}});
+    {{% endmacro %}}
+    """
+
+    macro = MacroElement()
+    macro._template = Template(template)
+    map_obj.add_child(macro)
+
+
+def add_legend(map_obj, thresholds=None):
+    """Add a robust Leaflet-control suitability legend with dark font."""
     interval_text = {
         1: "Lowest suitability zone",
         2: "Moderate suitability zone",
@@ -434,30 +478,17 @@ def add_legend(map_obj, thresholds=None):
         ]
     )
 
-    legend_html = f"""
-    <div style="
-        position: fixed;
-        bottom: 32px;
-        left: 32px;
-        z-index: 9999;
-        background: rgba(255,255,255,0.97);
-        color: #111111;
-        padding: 13px 15px;
-        border: 2px solid #222222;
-        border-radius: 8px;
-        font-size: 13px;
-        max-width: 345px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.30);
-        font-family: Arial, sans-serif;
-    ">
-        <div style="font-weight:900;color:#111111;margin-bottom:8px;font-size:14px;">Suitability Legend</div>
+    body_html = f"""
         {legend_items}
         <div style="margin-top:7px;padding-top:7px;border-top:1px solid #777;color:#111111;font-weight:800;">
             Export zone for structure planner: <span style="color:#006400;">Class 3 + Class 4</span>
         </div>
-    </div>
+        <style>
+            .geo-rwh-legend-title {{font-weight:900;color:#111111;margin-bottom:8px;font-size:14px;}}
+            .geo-rwh-leaflet-legend, .geo-rwh-leaflet-legend * {{color:#111111 !important;}}
+        </style>
     """
-    map_obj.get_root().html.add_child(folium.Element(legend_html))
+    add_leaflet_legend_control(map_obj, "Suitability Legend", body_html, position="bottomleft", width="360px", max_height="420px")
 
 
 def add_north_arrow(map_obj):
